@@ -192,16 +192,62 @@ impl<const N: usize> FrameElement<N> {
     }
 
     unsafe fn claim_receiving(this: NonNull<FrameElement<N>>) -> Option<NonNull<FrameElement<N>>> {
-        Self::swap_state(this, FrameState::Sent, FrameState::RxBusy)
-            .map_err(|actual_state| {
-                fmt::error!(
-                    "Failed to claim receiving frame {}: expected state {:?}, but got {:?}",
-                    (*addr_of_mut!((*this.as_ptr()).storage_slot_index)),
-                    FrameState::Sent,
-                    actual_state
-                );
-            })
-            .ok()
+        // PoC mitigation for race where RX may see the frame before TX marks it as Sent.
+        // Try fast-path Sent -> RxBusy, otherwise briefly spin if in Sending/Sendable, and
+        // ignore duplicates if already in an RX-related state.
+        const SPINS: usize = 64;
+        let idx = *addr_of_mut!((*this.as_ptr()).storage_slot_index);
+
+        let mut tries = 0usize;
+        loop {
+            let state = (*addr_of_mut!((*this.as_ptr()).status)).load(Ordering::Acquire);
+
+            match state {
+                FrameState::Sent => {
+                    return Self::swap_state(this, FrameState::Sent, FrameState::RxBusy).ok();
+                }
+                FrameState::Sending | FrameState::Sendable => {
+                    if tries < SPINS {
+                        tries += 1;
+                        core::hint::spin_loop();
+                        continue;
+                    }
+
+                    // Last-ditch: some NICs/OSes might deliver RX very fast; try to take from
+                    // Sending as a fallback to avoid flapping the task.
+                    if Self::swap_state(this, FrameState::Sending, FrameState::RxBusy).is_ok() {
+                        fmt::error!(
+                            "Claimed receiving frame {} from {:?} -> {:?} after spin",
+                            idx,
+                            FrameState::Sending,
+                            FrameState::RxBusy
+                        );
+                        return Some(this);
+                    }
+
+                    // Give up; TX will set to Sent shortly or another thread has progressed it.
+                    return None;
+                }
+                FrameState::RxBusy | FrameState::RxDone | FrameState::RxProcessing => {
+                    // Duplicate/delayed frame; someone already claimed/processed it. Ignore.
+                    fmt::error!(
+                        "Ignoring duplicate/delayed receiving frame {}, current state {:?}",
+                        idx,
+                        state
+                    );
+                    return None;
+                }
+                _ => {
+                    fmt::error!(
+                        "Failed to claim receiving frame {}: expected state {:?}, but got {:?}",
+                        idx,
+                        FrameState::Sent,
+                        state
+                    );
+                    return None;
+                }
+            }
+        }
     }
 
     unsafe fn storage_slot_index(this: NonNull<FrameElement<0>>) -> u8 {
