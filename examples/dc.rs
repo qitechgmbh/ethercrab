@@ -29,7 +29,7 @@ use ta::indicators::ExponentialMovingAverage;
 const MAX_SUBDEVICES: usize = 16;
 const MAX_PDU_DATA: usize = PduStorage::element_size(1100);
 const MAX_FRAMES: usize = 32;
-const PDI_LEN: usize = 64;
+const PDI_LEN: usize = 1200;
 
 static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
 
@@ -54,7 +54,7 @@ pub struct SupportedModes {
     dynamic: bool,
 }
 
-const TICK_INTERVAL: Duration = Duration::from_millis(5);
+const TICK_INTERVAL: Duration = Duration::from_millis(1);
 
 fn main() -> Result<(), Error> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
@@ -71,7 +71,7 @@ fn main() -> Result<(), Error> {
     let maindevice = Arc::new(MainDevice::new(
         pdu_loop,
         Timeouts {
-            wait_loop_delay: Duration::from_millis(5),
+            wait_loop_delay: Duration::from_millis(1),
             state_transition: Duration::from_secs(10),
             pdu: Duration::from_millis(2000),
             ..Timeouts::default()
@@ -106,21 +106,30 @@ fn main() -> Result<(), Error> {
     ))
     .expect("Main thread prio");
 
+
+
     smol::block_on(async {
         let mut group = maindevice
             .init_single_group::<MAX_SUBDEVICES, PDI_LEN>(ethercat_now)
             .await
             .expect("Init");
 
-        // The group will be in PRE-OP at this point
-
         for mut subdevice in group.iter_mut(&maindevice) {
-            if subdevice.name() == "LAN9252-EVB-HBI" {
+            println!("{} {:X}",subdevice.name(), subdevice.configured_address());
+            
+            if subdevice.name() == "EL4002" {
+                log::info!("Found EL4008");
+
                 // Sync mode 02 = SYNC0
                 subdevice
-                    .sdo_write(0x1c32, 1, 2u16)
+                    .sdo_write(0x1c32, 1, 1u16)
                     .await
                     .expect("Set sync mode");
+
+                /*subdevice
+                    .sdo_write(0x1c32, 0x02, TICK_INTERVAL.as_nanos() as u32)
+                    .await
+                    .expect("Set cycle time");*/
 
                 // ETG1020 calc and copy time
                 let cal_and_copy_time = subdevice
@@ -135,37 +144,27 @@ fn main() -> Result<(), Error> {
                     .expect("Delay time");
 
                 log::info!(
-                    "LAN9252 calc time {} ns, delay time {} ns",
+                    "--> Calc time {} ns, delay time {} ns",
                     cal_and_copy_time,
                     delay_time,
                 );
-
-                // Adding this seems to make the second LAN9252 converge much more quickly
-                subdevice
-                    .sdo_write(0x1c32, 0x0a, TICK_INTERVAL.as_nanos() as u32)
-                    .await
-                    .expect("Set cycle time");
-
                 let sync_type = subdevice.sdo_read::<u16>(0x1c32, 1).await?;
                 let cycle_time = subdevice.sdo_read::<u32>(0x1c32, 2).await?;
+                let shift_time = subdevice.sdo_read::<u32>(0x1c32, 3).await?;
                 let min_cycle_time = subdevice.sdo_read::<u32>(0x1c32, 5).await?;
-                let supported_sync_modes = subdevice.sdo_read::<SupportedModes>(0x1c32, 4).await?;
+                let supported_sync_modes = subdevice.sdo_read::<SupportedModes>(0x1c32, 4).await?;  
+                // NOTE: For EL4102, SupportedModes.sync1 is false, but the ESI file specifies it,
+                // and the 4102 won't go into OP without setting up SYNC1 with the correct offset.
+                // Brilliant.
                 log::info!(
-                    "--> Outputs sync mode {sync_type}, cycle time {cycle_time} ns (min {min_cycle_time} ns), supported modes {supported_sync_modes:?}"
+                    "--> Outputs sync mode {sync_type}, cycle time {cycle_time} ns (min {min_cycle_time} ns), shift {shift_time} ns, supported modes {supported_sync_modes:?}"
                 );
 
-                let sync_type = subdevice.sdo_read::<u16>(0x1c33, 1).await?;
-                let cycle_time = subdevice.sdo_read::<u32>(0x1c33, 2).await?;
-                let min_cycle_time = subdevice.sdo_read::<u32>(0x1c33, 5).await?;
-                let supported_sync_modes = subdevice.sdo_read::<SupportedModes>(0x1c33, 4).await?;
-                log::info!(
-                    "--> Inputs sync mode {sync_type}, cycle time {cycle_time} ns (min {min_cycle_time} ns), supported modes {supported_sync_modes:?}"
-                );
+ 
             }
-
             // Configure SYNC0 AND SYNC1 for EL4102
-            if subdevice.name() == "EL4102" {
-                log::info!("Found EL4102");
+            else if subdevice.name() == "EL5152" {
+                log::info!("Found EL5152");
 
                 // Sync mode 02 = SYNC0
                 subdevice
@@ -213,10 +212,17 @@ fn main() -> Result<(), Error> {
                     sync1_period: Duration::from_nanos(100_000),
                 });
             } else {
+                match subdevice.dc_support() {
+                    ethercrab::DcSupport::None => (),
+                    ethercrab::DcSupport::RefOnly => (),
+                    ethercrab::DcSupport::Bits64 =>                 subdevice.set_dc_sync(DcSync::Sync0),
+                    ethercrab::DcSupport::Bits32 =>                 subdevice.set_dc_sync(DcSync::Sync0),
+                }
                 // Enable SYNC0 for any other SubDevice kind
-                subdevice.set_dc_sync(DcSync::Sync0);
             }
         }
+
+
 
         log::info!("Group has {} SubDevices", group.len());
 
@@ -229,8 +235,10 @@ fn main() -> Result<(), Error> {
         log::info!("Moving into PRE-OP with PDI");
 
         let group = group.into_pre_op_pdi(&maindevice).await?;
-
         log::info!("Done. PDI available. Waiting for SubDevices to align");
+                        // The group will be in PRE-OP at this point
+
+
 
         let mut align_stats = {
             let mut w = csv::Writer::from_writer(File::create("dc-align.csv").expect("Open CSV"));
@@ -353,10 +361,10 @@ fn main() -> Result<(), Error> {
         let group = loop {
             let now = Instant::now();
 
+            
             match group_container.take().unwrap() {
-                GroupState::PreOp(group) => {
+                GroupState::PreOp(group) => {                                
                     let res = group.tx_rx_dc(&maindevice).await.expect("TX/RX");
-
                     if tick > 300 {
                         let group = group.request_into_safe_op(&maindevice).await?;
                         group_container = Some(GroupState::SafeOp(group));
@@ -364,10 +372,15 @@ fn main() -> Result<(), Error> {
                     } else {
                         group_container = Some(GroupState::PreOp(group));
                     }
-
+                    
                     smol::Timer::at(now + res.extra.next_cycle_wait).await;
                 }
                 GroupState::SafeOp(group) => {
+                    {
+                        let el4002 = group.subdevice(&maindevice, 4)?;
+                        let r = el4002.register_read_ignore_wkc::<u16>(0x134 as u16).await;
+                       // println!("al status code el4002: {:X?}",r);
+                    }
                     let res = group.tx_rx_dc(&maindevice).await.expect("TX/RX");
 
                     if res.all_safe_op() {
@@ -380,7 +393,7 @@ fn main() -> Result<(), Error> {
                     smol::Timer::at(now + res.extra.next_cycle_wait).await;
                 }
             }
-
+          //  println!("tick");
             tick += 1;
         };
 
@@ -482,7 +495,7 @@ fn main() -> Result<(), Error> {
                 let mut o = subdevice.outputs_raw_mut();
 
                 for byte in o.iter_mut() {
-                    *byte = byte.wrapping_add(1);
+                    //*byte = byte.wrapping_add(1);
                 }
             }
 

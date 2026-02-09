@@ -11,7 +11,7 @@ use crate::{
     al_status_code::AlStatusCode,
     coe::{
         self, CoeCommand, CoeService, SdoExpedited, SubIndex, abort_code::CoeAbortCode,
-        services::CoeServiceRequest,
+        services::{CoeServiceRequest, SdoExpeditedDownload, SdoNormalRequest},
     },
     command::Command,
     dl_status::DlStatus,
@@ -662,6 +662,80 @@ where
         Ok(response)
     }
 
+
+    async fn send_coe_service_hack(
+        &'maindevice self,
+        request: SdoNormalRequest,
+    ) -> Result<(), Error>
+    {
+        let (read_mailbox, write_mailbox) = self.coe_mailboxes().await?;
+        // Send data to SubDevice IN mailbox
+        self.write(write_mailbox.address)
+            .with_len(write_mailbox.len)
+            .send(self.maindevice, request)
+            .await?;
+        
+        let mut response = self.coe_response(&read_mailbox).await?;
+        /// A super generalised version of the various header shapes for responses, extracting only
+        /// what we need in this method.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, ethercrab_wire::EtherCrabWireRead)]
+        #[wire(bytes = 12)]
+        struct HeadersRaw {
+            #[wire(bytes = 8)]
+            header: MailboxHeader,
+
+            #[wire(pre_skip = 5, bits = 3)]
+            command: CoeCommand,
+
+            // 9 bytes up to here
+
+            // SAFETY: These fields will be garbage (but not invalid) if the response is NOT an
+            // abort transfer request. Use with caution!
+            #[wire(bytes = 2)]
+            address: u16,
+            #[wire(bytes = 1)]
+            sub_index: u8,
+        }
+        let headers = HeadersRaw::unpack_from_slice(&response)?;
+        if headers.command == CoeCommand::Abort {
+            let code = CoeAbortCode::Incompatible;
+
+            fmt::error!(
+                "Mailbox error for SubDevice {:#06x} (supports complete access: {}): {}",
+                self.configured_address,
+                self.state.config.mailbox.complete_access,
+                code
+            );
+
+            Err(Error::Mailbox(MailboxError::Aborted {
+                code,
+                address: headers.address,
+                sub_index: headers.sub_index,
+            }))
+        }
+        // Validate that the mailbox response is to the request we just sent
+        else if headers.header.mailbox_type != MailboxType::Coe
+        {
+            fmt::error!(
+                "Invalid SDO response. Type: {:?} (expected {:?}), index {}, subindex {}",
+                headers.header.mailbox_type,
+                MailboxType::Coe,
+                headers.address,
+                headers.sub_index,
+            );
+
+            Err(Error::Mailbox(MailboxError::SdoResponseInvalid {
+                address: headers.address,
+                sub_index: headers.sub_index,
+            }))
+        } else {
+            //let headers = R::unpack_from_slice(&response)?;
+            //response.trim_front(HeadersRaw::PACKED_LEN);
+            println!("Response: {:?} ",response);
+            Ok(())
+        }
+    }
+    
     /// Send a mailbox request, wait for response mailbox to be ready, read response from mailbox
     /// and return as a slice.
     async fn send_coe_service<R>(
@@ -795,30 +869,25 @@ where
         T: EtherCrabWireWrite,
     {
         let sub_index = sub_index.into();
-
         let counter = self.mailbox_counter();
 
+        // If value doesnt fit in expedited request, send normal request     
         if value.packed_len() > 4 {
-            fmt::error!("Only 4 byte SDO writes or smaller are supported currently.");
-
-            // TODO: Normal SDO download. Only expedited requests for now
-            return Err(Error::Internal);
+            let mut buf = [0u8; 128];
+            println!("Trying single Normal SDO Request!");
+            value.pack_to_slice(&mut buf)?;
+            let request = coe::services::download_normal(counter, index, sub_index, buf, value.packed_len() as u8);
+            self.send_coe_service_hack(request).await?;            
+            return Ok(());                        
+        }else {
+            let mut buf = [0u8; 4];
+            value.pack_to_slice(&mut buf)?;
+            let request : SdoExpeditedDownload =
+                coe::services::download(counter, index, sub_index, buf, value.packed_len() as u8);
+            fmt::trace!("CoE download");
+            let (_response, _data) = self.send_coe_service(request).await?;
+            Ok(())
         }
-
-        let mut buf = [0u8; 4];
-
-        value.pack_to_slice(&mut buf)?;
-
-        let request =
-            coe::services::download(counter, index, sub_index, buf, value.packed_len() as u8);
-
-        fmt::trace!("CoE download");
-
-        let (_response, _data) = self.send_coe_service(request).await?;
-
-        // TODO: Validate reply?
-
-        Ok(())
     }
 
     /// Write multiple sub-indices of the given SDO.

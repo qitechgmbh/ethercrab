@@ -1,3 +1,5 @@
+use ethercrab_wire::{EtherCrabWireWrite, EtherCrabWireWriteSized};
+
 use super::{CoeService, InitSdoHeader, SegmentSdoHeader, SubIndex};
 use crate::mailbox::{MailboxHeader, MailboxType, Priority};
 use core::fmt::Display;
@@ -106,6 +108,74 @@ impl CoeServiceRequest for SdoSegmented {
     fn validate_response(&self, _received_index: u16, _received_subindex: u8) -> bool {
         true
     }
+}
+
+impl EtherCrabWireWrite for SdoNormalRequest {
+    fn pack_to_slice_unchecked<'buf>(&self, buf: &'buf mut [u8]) -> &'buf [u8] {
+        // 1. Pack the initial SDO Header (Command, Index, Sub-index)
+        let header_len = self.sdo_normal.packed_len();
+        self.sdo_normal.pack_to_slice_unchecked(&mut buf[0..header_len]);
+
+
+        // 2. Pack the 'complete_size' (u32, 4 bytes)
+        // This is usually required for SDO Normal Download (Request)
+        let size_bytes = self.complete_size.to_le_bytes();
+        let size_start = header_len;
+        let size_end = header_len + 4;
+        buf[size_start..size_end].copy_from_slice(&size_bytes);
+
+        // 3. Pack the actual data payload
+        let data_start = size_end;
+        let data_end = data_start + self.data.len();
+        buf[data_start..data_end].copy_from_slice(&self.data);
+
+        // Return the total slice written
+        &buf[0..data_end]
+    }
+
+    fn packed_len(&self) -> usize {
+        self.data.len() +  self.sdo_normal.packed_len() + 4 
+    }
+}
+
+#[derive(Debug)]
+pub struct SdoNormalRequest {
+    sdo_normal : SdoNormal,
+    complete_size: u32, // dword
+    data : [u8;128],
+}
+
+pub fn download_normal(
+    counter: u8,
+    index: u16,
+    access: SubIndex,
+    data : [u8;128],
+    data_len: u8,
+) -> SdoNormalRequest {
+    SdoNormalRequest {
+        sdo_normal:        
+            SdoNormal { 
+                header: MailboxHeader { 
+                    length: 0x0a + data_len as u16, 
+                    priority: Priority::High,
+                mailbox_type: MailboxType::Coe, 
+                    counter: counter, 
+                    service: CoeService::SdoRequest 
+                }, 
+                sdo_header: InitSdoHeader{ 
+                    size_indicator:true, 
+                    expedited_transfer:false, 
+                    size:0, // Not used for normal? 
+                    complete_access: access.complete_access(), 
+                    command: super::CoeCommand::Download, 
+                    index, 
+                    sub_index: access.sub_index(),
+                }, 
+        },
+        complete_size: data_len as u32,
+        data,
+    }
+
 }
 
 pub fn download(
